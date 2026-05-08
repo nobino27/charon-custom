@@ -1143,6 +1143,14 @@ function updateCandidateStatus(candidateId, status) {
   db.prepare('UPDATE candidates SET status = ?, updated_at_ms = ? WHERE id = ?').run(status, now(), candidateId);
 }
 
+function updateCandidateSnapshot(candidateId, candidate, status = null) {
+  db.prepare(`
+    UPDATE candidates
+    SET status = COALESCE(?, status), updated_at_ms = ?, candidate_json = ?, filter_result_json = ?
+    WHERE id = ?
+  `).run(status, now(), json(candidate), json(candidate.filters || {}), candidateId);
+}
+
 function candidateById(id) {
   const row = db.prepare('SELECT * FROM candidates WHERE id = ?').get(id);
   return row ? { ...row, candidate: safeJson(row.candidate_json, {}) } : null;
@@ -1371,6 +1379,84 @@ async function freshEntryMarket(mint, candidate) {
     candidate.metrics?.graduatedMarketCapUsd,
   );
   return { gmgn, asset, priceUsd, marketCapUsd, refreshedAtMs: now() };
+}
+
+async function refreshCandidateForExecution(row) {
+  const candidate = row.candidate;
+  const mint = candidate.token.mint;
+  const gmgn = await fetchGmgnTokenInfo(mint, false);
+  const asset = await fetchJupiterAsset(mint);
+  const holders = await fetchJupiterHolders(mint);
+  const chart = await fetchJupiterChartContext(mint);
+  const selectedTrending = trending.get(mint) || candidate.trending || null;
+  const selectedHolders = holders?.holders?.length ? holders : candidate.holders;
+  const selectedSavedWalletExposure = selectedHolders
+    ? await fetchSavedWalletExposure(mint, selectedHolders)
+    : candidate.savedWalletExposure;
+  const priceUsd = firstPositiveNumber(tokenPriceFromGmgn(gmgn), asset?.usdPrice, selectedTrending?.price, candidate.metrics?.priceUsd);
+  const marketCapUsd = firstPositiveNumber(
+    marketCapFromGmgn(gmgn),
+    asset?.mcap,
+    asset?.fdv,
+    selectedTrending?.market_cap,
+    candidate.metrics?.marketCapUsd,
+    candidate.metrics?.graduatedMarketCapUsd,
+  );
+  const refreshed = {
+    ...candidate,
+    token: {
+      ...candidate.token,
+      name: gmgn?.name || asset?.name || selectedTrending?.name || candidate.token.name,
+      symbol: gmgn?.symbol || asset?.symbol || selectedTrending?.symbol || candidate.token.symbol,
+      twitter: candidate.token.twitter || asset?.twitter || gmgn?.link?.twitter_username || selectedTrending?.twitter || '',
+      website: candidate.token.website || asset?.website || gmgn?.link?.website || '',
+      telegram: candidate.token.telegram || gmgn?.link?.telegram || '',
+    },
+    metrics: {
+      ...candidate.metrics,
+      priceUsd,
+      marketCapUsd,
+      liquidityUsd: Number(gmgn?.liquidity ?? asset?.liquidity ?? selectedTrending?.liquidity ?? candidate.metrics?.liquidityUsd ?? 0),
+      holderCount: Number(gmgn?.holder_count ?? asset?.holderCount ?? selectedTrending?.holder_count ?? candidate.metrics?.holderCount ?? 0),
+      gmgnTotalFeesSol: Number(gmgn?.total_fee ?? asset?.fees ?? candidate.metrics?.gmgnTotalFeesSol ?? 0),
+      gmgnTradeFeesSol: Number(gmgn?.trade_fee ?? candidate.metrics?.gmgnTradeFeesSol ?? 0),
+      trendingVolumeUsd: Number(selectedTrending?.volume ?? candidate.metrics?.trendingVolumeUsd ?? 0),
+      trendingSwaps: Number(selectedTrending?.swaps ?? candidate.metrics?.trendingSwaps ?? 0),
+      trendingHotLevel: Number(selectedTrending?.hot_level ?? candidate.metrics?.trendingHotLevel ?? 0),
+      trendingSmartDegenCount: Number(selectedTrending?.smart_degen_count ?? candidate.metrics?.trendingSmartDegenCount ?? 0),
+    },
+    gmgn,
+    jupiterAsset: asset,
+    trending: selectedTrending,
+    holders: selectedHolders,
+    chart,
+    savedWalletExposure: selectedSavedWalletExposure,
+    executionRefresh: {
+      refreshedAtMs: now(),
+      source: 'pre_execution',
+      marketCapUsd,
+      priceUsd,
+      liquidityUsd: Number(gmgn?.liquidity ?? asset?.liquidity ?? selectedTrending?.liquidity ?? 0),
+      holdersRefreshed: Boolean(holders?.holders?.length),
+    },
+  };
+  refreshed.filters = filterCandidate(refreshed);
+  const executionFailures = [];
+  if (!Number.isFinite(Number(refreshed.metrics.marketCapUsd)) || Number(refreshed.metrics.marketCapUsd) <= 0) {
+    executionFailures.push('execution mcap: missing');
+  }
+  if (!Number.isFinite(Number(refreshed.metrics.priceUsd)) || Number(refreshed.metrics.priceUsd) <= 0) {
+    executionFailures.push('execution price: missing');
+  }
+  if (executionFailures.length) {
+    refreshed.filters = {
+      ...refreshed.filters,
+      passed: false,
+      failures: [...(refreshed.filters?.failures || []), ...executionFailures],
+    };
+  }
+  updateCandidateSnapshot(row.id, refreshed, refreshed.filters.passed ? 'candidate' : 'filtered');
+  return { ...row, candidate: refreshed };
 }
 
 async function createDryRunPosition(candidateId, candidate, decision, reason = 'llm_buy') {
@@ -1979,15 +2065,29 @@ async function executeConfirmedIntent(chatId, intentId) {
   if (!canOpenMorePositions()) {
     return bot.sendMessage(chatId, `Max open positions reached (${openPositionCount()}/${numSetting('max_open_positions', 3)}).`);
   }
-  const { candidate, decision } = intent.payload;
+  const { decision } = intent.payload;
   try {
+    const freshRow = await refreshCandidateForExecution({
+      id: intent.candidate_id,
+      candidate: intent.payload.candidate,
+    });
+    if (!freshRow.candidate.filters?.passed) {
+      db.prepare('UPDATE trade_intents SET status = ?, updated_at_ms = ? WHERE id = ?').run('rejected_stale', now(), intentId);
+      return bot.sendMessage(chatId, [
+        '🛑 <b>Trade intent rejected on fresh check</b>',
+        '',
+        candidateSummary(freshRow.candidate, decision),
+        '',
+        `Failures: ${escapeHtml((freshRow.candidate.filters?.failures || []).join('; ') || 'fresh execution guard failed')}`,
+      ].join('\n'), { parse_mode: 'HTML', disable_web_page_preview: true });
+    }
     const amountLamports = Math.floor(numSetting('dry_run_buy_sol', 0.1) * 1_000_000_000);
     const swap = await executeJupiterSwap({
       inputMint: WSOL_MINT,
-      outputMint: candidate.token.mint,
+      outputMint: freshRow.candidate.token.mint,
       amount: amountLamports,
     });
-    const positionId = createLivePosition(intent.candidate_id, candidate, decision, swap, `confirmed_intent_${intentId}`);
+    const positionId = createLivePosition(intent.candidate_id, freshRow.candidate, decision, swap, `confirmed_intent_${intentId}`);
     db.prepare('UPDATE trade_intents SET status = ?, updated_at_ms = ? WHERE id = ?').run('executed_live', now(), intentId);
     return sendPositionOpen(positionId);
   } catch (err) {
@@ -2041,13 +2141,40 @@ async function executeLiveSell(position, reason) {
 
 async function handleApprovedBuy(selectedRow, decision, batchId, rows = [], triggerCandidateId = null) {
   const mode = tradingMode();
-  if (mode === 'dry_run') {
-    const positionId = await createDryRunPosition(selectedRow.id, selectedRow.candidate, decision, `llm_batch_${batchId}`);
+  const freshSelectedRow = await refreshCandidateForExecution(selectedRow);
+  const executionRows = rows.map(row => row.id === freshSelectedRow.id ? freshSelectedRow : row);
+  if (!freshSelectedRow.candidate.filters?.passed) {
+    updateCandidateStatus(freshSelectedRow.id, 'stale_rejected');
     logDecisionEvent({
       batchId,
       triggerCandidateId,
-      selectedRow,
-      rows,
+      selectedRow: freshSelectedRow,
+      rows: executionRows,
+      decision,
+      mode,
+      action: 'entry_rejected_fresh_filters',
+      guardrails: {
+        failures: freshSelectedRow.candidate.filters?.failures || [],
+        refreshedAtMs: freshSelectedRow.candidate.executionRefresh?.refreshedAtMs,
+      },
+    });
+    await sendTelegram([
+      '🛑 <b>Execution rejected on fresh check</b>',
+      '',
+      candidateSummary(freshSelectedRow.candidate, decision),
+      '',
+      `Failures: ${escapeHtml((freshSelectedRow.candidate.filters?.failures || []).join('; ') || 'fresh execution guard failed')}`,
+    ].join('\n'));
+    return;
+  }
+
+  if (mode === 'dry_run') {
+    const positionId = await createDryRunPosition(freshSelectedRow.id, freshSelectedRow.candidate, decision, `llm_batch_${batchId}`);
+    logDecisionEvent({
+      batchId,
+      triggerCandidateId,
+      selectedRow: freshSelectedRow,
+      rows: executionRows,
       decision,
       mode,
       action: 'dry_run_entry',
@@ -2059,31 +2186,31 @@ async function handleApprovedBuy(selectedRow, decision, batchId, rows = [], trig
   }
 
   if (mode === 'confirm') {
-    const intentId = createTradeIntent(selectedRow.id, selectedRow.candidate, decision, mode, 'pending_confirmation');
+    const intentId = createTradeIntent(freshSelectedRow.id, freshSelectedRow.candidate, decision, mode, 'pending_confirmation');
     logDecisionEvent({
       batchId,
       triggerCandidateId,
-      selectedRow,
-      rows,
+      selectedRow: freshSelectedRow,
+      rows: executionRows,
       decision,
       mode,
       action: 'confirm_intent_created',
       guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount() },
       execution: { intentId },
     });
-    await sendTradeIntent(intentId, selectedRow.candidate, decision);
+    await sendTradeIntent(intentId, freshSelectedRow.candidate, decision);
     return;
   }
 
   try {
-    await executeLiveBuy(selectedRow, decision, batchId, rows, triggerCandidateId);
+    await executeLiveBuy(freshSelectedRow, decision, batchId, executionRows, triggerCandidateId);
   } catch (err) {
-    const intentId = createTradeIntent(selectedRow.id, selectedRow.candidate, decision, mode, 'execution_failed');
+    const intentId = createTradeIntent(freshSelectedRow.id, freshSelectedRow.candidate, decision, mode, 'execution_failed');
     logDecisionEvent({
       batchId,
       triggerCandidateId,
-      selectedRow,
-      rows,
+      selectedRow: freshSelectedRow,
+      rows: executionRows,
       decision,
       mode,
       action: 'live_entry_failed',
@@ -2093,7 +2220,7 @@ async function handleApprovedBuy(selectedRow, decision, batchId, rows = [], trig
     await sendTelegram([
       '🛑 <b>Live trade failed</b>',
       '',
-      candidateSummary(selectedRow.candidate, decision),
+      candidateSummary(freshSelectedRow.candidate, decision),
       '',
       `Intent #${intentId} stored.`,
       `Error: ${escapeHtml(err.message)}`,

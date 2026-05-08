@@ -27,6 +27,7 @@ import {
   TRENDING_LOOKBACK_MS,
   GMGN_CACHE_TTL_MS,
   POSITION_CHECK_MS,
+  LLM_TIMEOUT_MS,
   ENABLE_LLM,
   JSON_HEADERS,
   validateConfig,
@@ -266,6 +267,7 @@ function initDb() {
     agent_enabled: 'true',
     trading_mode: process.env.TRADING_MODE || 'dry_run',
     llm_candidate_pick_count: process.env.LLM_CANDIDATE_PICK_COUNT || '10',
+    llm_candidate_max_age_ms: process.env.LLM_CANDIDATE_MAX_AGE_MS || String(10 * 60 * 1000),
     llm_min_confidence: '75',
     max_open_positions: process.env.MAX_OPEN_POSITIONS || '3',
     dry_run_buy_sol: '0.1',
@@ -631,6 +633,27 @@ async function fetchJupiterAsset(mint) {
     console.log(`[asset] ${mint.slice(0, 8)}... ${err.response?.status || ''} ${err.message}`);
     return null;
   }
+}
+
+async function fetchSolUsdPrice() {
+  try {
+    const res = await axios.get(`https://lite-api.jup.ag/price/v3?ids=${WSOL_MINT}`, {
+      timeout: 5000,
+      headers: JSON_HEADERS,
+    });
+    const price = Number(res.data?.[WSOL_MINT]?.usdPrice);
+    return Number.isFinite(price) && price > 0 ? price : null;
+  } catch (err) {
+    console.log(`[sol-price] ${err.response?.status || ''} ${err.message}`);
+    return null;
+  }
+}
+
+async function estimateTokenAmountFromSol(sizeSol, entryPrice) {
+  if (!Number.isFinite(Number(entryPrice)) || Number(entryPrice) <= 0) return null;
+  const solUsd = await fetchSolUsdPrice();
+  if (!Number.isFinite(Number(solUsd)) || Number(solUsd) <= 0) return null;
+  return Number(sizeSol) * solUsd / Number(entryPrice);
 }
 
 async function fetchJupiterHolders(mint) {
@@ -1085,7 +1108,20 @@ function upsertCandidate(candidate, signature) {
   const signalKey = candidateSignalKey(candidate, signature);
   const existing = db.prepare('SELECT id FROM candidates WHERE signal_key = ?')
     .get(signalKey);
-  if (existing) return existing.id;
+  if (existing) {
+    db.prepare(`
+      UPDATE candidates
+      SET status = ?, updated_at_ms = ?, candidate_json = ?, filter_result_json = ?
+      WHERE id = ?
+    `).run(
+      candidate.filters.passed ? 'candidate' : 'filtered',
+      now(),
+      json(candidate),
+      json(candidate.filters),
+      existing.id,
+    );
+    return existing.id;
+  }
 
   const result = db.prepare(`
     INSERT INTO candidates (mint, status, created_at_ms, updated_at_ms, signature, signal_key, candidate_json, filter_result_json)
@@ -1118,14 +1154,17 @@ function latestCandidateByMint(mint) {
 }
 
 function recentEligibleCandidates(limit = 10) {
+  const maxAgeMs = numSetting('llm_candidate_max_age_ms', 10 * 60 * 1000);
+  const cutoff = now() - Math.max(30_000, maxAgeMs);
   const rows = db.prepare(`
     SELECT *
     FROM candidates
     WHERE status IN ('candidate', 'watch', 'buy', 'pass')
+      AND created_at_ms >= ?
       AND id NOT IN (SELECT COALESCE(candidate_id, -1) FROM dry_run_positions WHERE status = 'open')
     ORDER BY id DESC
     LIMIT ?
-  `).all(limit);
+  `).all(cutoff, limit);
   return rows.map(row => ({ ...row, candidate: safeJson(row.candidate_json, {}) })).reverse();
 }
 
@@ -1221,7 +1260,7 @@ async function decideCandidateBatch(rows, triggerCandidateId) {
         { role: 'user', content: JSON.stringify(user) },
       ],
     }, {
-      timeout: 30_000,
+      timeout: LLM_TIMEOUT_MS,
       headers: { authorization: `Bearer ${LLM_API_KEY}`, 'content-type': 'application/json' },
     });
     const content = res.data?.choices?.[0]?.message?.content || '';
@@ -1296,11 +1335,26 @@ function storeBatchDecision(triggerCandidateId, rows, decision) {
   return Number(result.lastInsertRowid);
 }
 
-function createDryRunPosition(candidateId, candidate, decision, reason = 'llm_buy') {
+async function freshEntryMarket(mint, candidate) {
+  const gmgn = await fetchGmgnTokenInfo(mint, false);
+  const asset = await fetchJupiterAsset(mint);
+  const priceUsd = firstPositiveNumber(tokenPriceFromGmgn(gmgn), asset?.usdPrice, candidate.metrics?.priceUsd);
+  const marketCapUsd = firstPositiveNumber(
+    marketCapFromGmgn(gmgn),
+    asset?.mcap,
+    asset?.fdv,
+    candidate.metrics?.marketCapUsd,
+    candidate.metrics?.graduatedMarketCapUsd,
+  );
+  return { gmgn, asset, priceUsd, marketCapUsd, refreshedAtMs: now() };
+}
+
+async function createDryRunPosition(candidateId, candidate, decision, reason = 'llm_buy') {
   const sizeSol = numSetting('dry_run_buy_sol', 0.1);
-  const entryPrice = Number(candidate.metrics.priceUsd || 0) || null;
-  const entryMcap = Number(candidate.metrics.marketCapUsd || candidate.metrics.graduatedMarketCapUsd || 0) || null;
-  const tokenAmount = entryPrice && entryPrice > 0 ? sizeSol * Number(process.env.SOL_USD_MARK || 100) / entryPrice : null;
+  const fresh = await freshEntryMarket(candidate.token.mint, candidate);
+  const entryPrice = Number(fresh.priceUsd || 0) || null;
+  const entryMcap = Number(fresh.marketCapUsd || 0) || null;
+  const tokenAmount = await estimateTokenAmountFromSol(sizeSol, entryPrice);
   const tp = Number(decision.suggested_tp_percent || numSetting('default_tp_percent', 50));
   const sl = Number(decision.suggested_sl_percent || numSetting('default_sl_percent', -25));
   const trailingEnabled = boolSetting('default_trailing_enabled', true) ? 1 : 0;
@@ -1332,13 +1386,13 @@ function createDryRunPosition(candidateId, candidate, decision, reason = 'llm_bu
     trailingEnabled,
     trailingPercent,
     decision.id || null,
-    json({ candidate, decision, reason }),
+    json({ candidate, decision, reason, freshEntryMarket: fresh }),
   );
   const positionId = Number(result.lastInsertRowid);
   db.prepare(`
     INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
     VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?)
-  `).run(positionId, candidate.token.mint, now(), entryPrice, entryMcap, sizeSol, tokenAmount, reason, json({ candidateId, decision }));
+  `).run(positionId, candidate.token.mint, now(), entryPrice, entryMcap, sizeSol, tokenAmount, reason, json({ candidateId, decision, freshEntryMarket: fresh }));
   db.prepare(`
     INSERT INTO tp_sl_rules (position_id, tp_percent, sl_percent, trailing_enabled, trailing_percent, updated_at_ms)
     VALUES (?, ?, ?, ?, ?, ?)
@@ -1882,7 +1936,7 @@ async function executeLiveSell(position, reason) {
 async function handleApprovedBuy(selectedRow, decision, batchId, rows = [], triggerCandidateId = null) {
   const mode = tradingMode();
   if (mode === 'dry_run') {
-    const positionId = createDryRunPosition(selectedRow.id, selectedRow.candidate, decision, `llm_batch_${batchId}`);
+    const positionId = await createDryRunPosition(selectedRow.id, selectedRow.candidate, decision, `llm_batch_${batchId}`);
     logDecisionEvent({
       batchId,
       triggerCandidateId,
@@ -2256,6 +2310,7 @@ function agentText() {
     `Confidence: ${fmtPct(numSetting('llm_min_confidence', 75))}`,
     `Open positions: ${openPositionCount()}/${numSetting('max_open_positions', 3) || 'unlimited'}`,
     `Batch candidates: ${numSetting('llm_candidate_pick_count', 10)}`,
+    `Candidate freshness: ${Math.round(numSetting('llm_candidate_max_age_ms', 600000) / 1000)}s`,
     `Dry size: ${fmtSol(numSetting('dry_run_buy_sol', 0.1))} SOL`,
     `Default TP/SL: ${fmtPct(numSetting('default_tp_percent', 50))} / ${fmtPct(numSetting('default_sl_percent', -25))}`,
     `Trailing: ${boolSetting('default_trailing_enabled', true) ? fmtPct(numSetting('default_trailing_percent', 20)) : 'off'}`,
@@ -2280,6 +2335,11 @@ function agentKeyboard() {
         [
           { text: 'Batch 5', callback_data: 'set:llm_candidate_pick_count:5' },
           { text: 'Batch 10', callback_data: 'set:llm_candidate_pick_count:10' },
+        ],
+        [
+          { text: 'Fresh 5m', callback_data: 'set:llm_candidate_max_age_ms:300000' },
+          { text: 'Fresh 10m', callback_data: 'set:llm_candidate_max_age_ms:600000' },
+          { text: 'Fresh 20m', callback_data: 'set:llm_candidate_max_age_ms:1200000' },
         ],
         [{ text: 'Back', callback_data: 'menu:main' }],
       ],
@@ -2360,7 +2420,7 @@ async function handleCallback(query) {
       await executeLiveBuy(row, decision, 'manual', [row], row.id);
       return;
     }
-    const positionId = createDryRunPosition(row.id, candidate, decision, 'manual_buy');
+    const positionId = await createDryRunPosition(row.id, candidate, decision, 'manual_buy');
     logDecisionEvent({
       batchId: 'manual',
       triggerCandidateId: row.id,
@@ -2519,6 +2579,7 @@ async function updateSettingFromButton(chatId, key, value) {
     'trading_mode',
     'llm_min_confidence',
     'llm_candidate_pick_count',
+    'llm_candidate_max_age_ms',
     'max_open_positions',
     'dry_run_buy_sol',
     'default_tp_percent',
@@ -2528,10 +2589,10 @@ async function updateSettingFromButton(chatId, key, value) {
   ]);
   if (!valid.has(key) || value == null) return bot.sendMessage(chatId, 'Unknown setting.');
   setSetting(key, value);
-  const text = key.startsWith('default_') || key === 'dry_run_buy_sol' || key === 'trading_mode' || key === 'llm_min_confidence' || key === 'llm_candidate_pick_count' || key === 'max_open_positions'
+  const text = key.startsWith('default_') || key === 'dry_run_buy_sol' || key === 'trading_mode' || key === 'llm_min_confidence' || key === 'llm_candidate_pick_count' || key === 'llm_candidate_max_age_ms' || key === 'max_open_positions'
     ? agentText()
     : filtersText();
-  const extra = key.startsWith('default_') || key === 'dry_run_buy_sol' || key === 'trading_mode' || key === 'llm_min_confidence' || key === 'llm_candidate_pick_count' || key === 'max_open_positions'
+  const extra = key.startsWith('default_') || key === 'dry_run_buy_sol' || key === 'trading_mode' || key === 'llm_min_confidence' || key === 'llm_candidate_pick_count' || key === 'llm_candidate_max_age_ms' || key === 'max_open_positions'
     ? agentKeyboard()
     : filtersKeyboard();
   return bot.sendMessage(chatId, text, { parse_mode: 'HTML', ...extra });
@@ -2651,6 +2712,7 @@ async function handleMessage(msg) {
       'trading_mode',
       'llm_min_confidence',
       'llm_candidate_pick_count',
+      'llm_candidate_max_age_ms',
       'max_open_positions',
       'dry_run_buy_sol',
       'default_tp_percent',

@@ -51,7 +51,9 @@ Optional env:
 - `LLM_BASE_URL`
 - `LLM_API_KEY`
 - `LLM_MODEL`
+- `LLM_TIMEOUT_MS`
 - `LLM_CANDIDATE_PICK_COUNT`
+- `LLM_CANDIDATE_MAX_AGE_MS`
 - `MAX_OPEN_POSITIONS`
 - `MIN_FEE_CLAIM_SOL`
 - `GRADUATED_POLL_MS`
@@ -70,7 +72,6 @@ Optional env:
 - `TRENDING_MAX_BUNDLER_RATE`
 - `GMGN_CACHE_TTL_MS`
 - `POSITION_CHECK_MS`
-- `SOL_USD_MARK`
 
 ## Telegram UX
 
@@ -134,6 +135,7 @@ Useful `/setfilter` names:
 - `trending_max_bundler_rate`
 - `llm_min_confidence`
 - `llm_candidate_pick_count`
+- `llm_candidate_max_age_ms`
 - `max_open_positions`
 - `dry_run_buy_sol`
 - `default_tp_percent`

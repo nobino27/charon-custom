@@ -75,6 +75,11 @@ export async function handleMessage(msg) {
     updateStrategyConfig(id, newConfig);
     return bot.sendMessage(chatId, `Updated ${id}.${key} = ${value}\n\n${strategyMenuText()}`, { parse_mode: 'HTML' });
   }
+  if (text.startsWith('/forceclose')) {
+    const id = Number(text.split(/\s+/)[1]);
+    if (!id) return bot.sendMessage(chatId, 'Usage: /forceclose <position_id>');
+    return forceClosePosition(chatId, id);
+  }
   if (text.startsWith('/pnl')) return sendPnl(chatId);
   if (text.startsWith('/learn')) {
     const windowArg = text.split(/\s+/)[1] || '12h';
@@ -199,6 +204,27 @@ export async function closePosition(chatId, id, reason) {
   await bot.sendMessage(chatId, `${label} #${id}: ${escapeHtml(reason)} ${fmtPct(pnlPercent)}`, { parse_mode: 'HTML' });
 }
 
+export async function forceClosePosition(chatId, id) {
+  const row = db.prepare('SELECT * FROM dry_run_positions WHERE id = ?').get(id);
+  if (!row) return bot.sendMessage(chatId, `Position #${id} not found.`);
+  if (row.status !== 'open') return bot.sendMessage(chatId, `Position #${id} is already ${row.status}.`);
+  const price = row.high_water_price || row.entry_price;
+  const mcap = row.high_water_mcap || row.entry_mcap;
+  const pnlPercent = row.entry_mcap && mcap ? (Number(mcap) / Number(row.entry_mcap) - 1) * 100 : 0;
+  const pnlSol = Number(row.size_sol) * pnlPercent / 100;
+  db.prepare(`
+    UPDATE dry_run_positions
+    SET status = 'closed', closed_at_ms = ?, exit_price = ?, exit_mcap = ?, exit_reason = ?,
+        pnl_percent = ?, pnl_sol = ?
+    WHERE id = ?
+  `).run(now(), price, mcap, 'FORCE_CLOSED', pnlPercent, pnlSol, id);
+  db.prepare(`
+    INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
+    VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, row.mint, now(), price, mcap, row.size_sol, row.token_amount_est, 'FORCE_CLOSED', json({ pnlPercent, pnlSol }));
+  await bot.sendMessage(chatId, `Force closed position #${id} (${escapeHtml(row.symbol || row.mint.slice(0, 8))}) — sold manually, no on-chain tx.`, { parse_mode: 'HTML' });
+}
+
 export async function updatePositionRule(chatId, id, field, nextValue, query = null) {
   if (!Number.isFinite(nextValue)) return bot.sendMessage(chatId, 'Invalid value.');
   db.prepare(`UPDATE dry_run_positions SET ${field} = ? WHERE id = ?`).run(nextValue, id);
@@ -251,6 +277,7 @@ export function setupTelegram() {
     { command: 'walletadd', description: 'Save wallet for exposure/PnL' },
     { command: 'walletremove', description: 'Remove saved wallet' },
     { command: 'wallets', description: 'List saved wallets' },
+    { command: 'forceclose', description: 'Force close position (manual sell)' },
   ]).catch(err => console.log(`[telegram] commands ${err.message}`));
 
   bot.on('callback_query', query => handleCallback(query).catch(err => console.log(`[callback] ${err.message}`)));

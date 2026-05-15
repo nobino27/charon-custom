@@ -17,6 +17,13 @@ import { createTradeIntent } from '../db/intents.js';
 
 export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], triggerCandidateId = null) {
   const strat = activeStrategy();
+  const mint = selectedRow.candidate.token.mint;
+  const existingPos = db.prepare(
+    "SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' LIMIT 1"
+  ).get(mint);
+  if (existingPos) {
+    throw new Error(`Already have open position #${existingPos.id} for ${mint.slice(0, 8)}... — skipping duplicate buy`);
+  }
   const amountLamports = Math.floor((strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1)) * 1_000_000_000);
   const balance = await liveWalletBalanceLamports();
   if (balance < amountLamports + LIVE_MIN_SOL_RESERVE_LAMPORTS) {
@@ -78,6 +85,14 @@ export async function executeConfirmedIntent(chatId, intentId) {
       ].join('\n'), { parse_mode: 'HTML', disable_web_page_preview: true });
     }
     const strat = activeStrategy();
+    const mint = freshRow.candidate.token.mint;
+    const existingPos = db.prepare(
+      "SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' LIMIT 1"
+    ).get(mint);
+    if (existingPos) {
+      db.prepare('UPDATE trade_intents SET status = ?, updated_at_ms = ? WHERE id = ?').run('rejected_duplicate', now(), intentId);
+      return bot.sendMessage(chatId, `Already have open position #${existingPos.id} for ${mint.slice(0, 8)}... — skipping duplicate buy.`, { parse_mode: 'HTML' });
+    }
     const amountLamports = Math.floor((strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1)) * 1_000_000_000);
     const balance = await liveWalletBalanceLamports();
     if (balance < amountLamports + LIVE_MIN_SOL_RESERVE_LAMPORTS) {

@@ -79,7 +79,7 @@ export function recentEligibleCandidates(limit = 10) {
     FROM candidates
     WHERE status IN ('candidate', 'watch', 'buy', 'pass')
       AND created_at_ms >= ?
-      AND id NOT IN (SELECT COALESCE(candidate_id, -1) FROM dry_run_positions WHERE status = 'open')
+      AND mint NOT IN (SELECT mint FROM dry_run_positions WHERE status = 'open')
     ORDER BY id DESC
     LIMIT ?
   `).all(cutoff, limit);

@@ -1,5 +1,6 @@
 import { now, pruneSeen } from '../utils.js';
 import { numSetting, boolSetting } from '../db/settings.js';
+import { db } from '../db/connection.js';
 import { upsertCandidate, updateCandidateStatus, recentEligibleCandidates, candidateById } from '../db/candidates.js';
 import { storeDecision, storeBatchDecision, logDecisionEvent } from '../db/decisions.js';
 import { buildCandidate, filterCandidate, signalLabel } from './candidateBuilder.js';
@@ -27,6 +28,15 @@ export async function processCandidateFromSignals(signals) {
   if (!canOpenMorePositions()) {
     const max = numSetting('max_open_positions', 3);
     console.log(`[agent] max positions reached (${openPositionCount()}/${max}), skipping ${signals.mint.slice(0, 8)}...`);
+    return;
+  }
+
+  // Skip if already have an open position for this mint
+  const existingPosition = db.prepare(
+    "SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' LIMIT 1"
+  ).get(signals.mint);
+  if (existingPosition) {
+    console.log(`[agent] already have open position #${existingPosition.id} for ${signals.mint.slice(0, 8)}..., skipping`);
     return;
   }
 

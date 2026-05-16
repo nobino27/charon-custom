@@ -177,11 +177,30 @@ export function mainMenuText() {
 }
 
 export function walletsText() {
+  return walletsPageText(0);
+}
+
+export function walletsPageText(page = 0, pageSize = 20) {
   const rows = savedWallets();
-  const body = rows.length
-    ? rows.map(row => `• <b>${escapeHtml(row.label)}</b>: <code>${escapeHtml(row.address)}</code>`).join('\n')
-    : 'No saved wallets. Use /walletadd &lt;label&gt; &lt;address&gt;';
-  return `👛 <b>Saved Wallets</b>\n\n${body}`;
+  if (!rows.length) return '👛 <b>Saved Wallets</b>\n\nNo saved wallets. Use /walletadd &lt;label&gt; &lt;address&gt;';
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safePage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
+  const start = safePage * pageSize;
+  const pageRows = rows.slice(start, start + pageSize);
+  const body = pageRows.map((row, index) => {
+    const source = row.source ? ` (${escapeHtml(row.source)})` : '';
+    return `${start + index + 1}. <b>${escapeHtml(row.label)}</b>${source}: <code>${escapeHtml(short(row.address))}</code>`;
+  }).join('\n');
+  return `👛 <b>Saved Wallets</b> (${rows.length}) · Page <b>${safePage + 1}/${totalPages}</b>\n\n${body}`;
+}
+
+export function walletsPageKeyboard(page = 0, pageSize = 20) {
+  const totalPages = Math.max(1, Math.ceil(savedWallets().length / pageSize));
+  const safePage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
+  const nav = [];
+  if (safePage > 0) nav.push({ text: 'Prev', callback_data: `menu:wallets:${safePage - 1}` });
+  if (safePage < totalPages - 1) nav.push({ text: 'Next', callback_data: `menu:wallets:${safePage + 1}` });
+  return navKeyboard(nav.length ? [nav] : []);
 }
 
 export function positionsText() {

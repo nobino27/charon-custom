@@ -13,6 +13,7 @@ export function initDb() {
     CREATE TABLE IF NOT EXISTS saved_wallets (
       label TEXT PRIMARY KEY,
       address TEXT NOT NULL UNIQUE,
+      source TEXT,
       created_at_ms INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS candidates (
@@ -200,6 +201,7 @@ export function initDb() {
     CREATE INDEX IF NOT EXISTS idx_learning_lessons_status ON learning_lessons(status, created_at_ms);
   `);
   ensureColumn('candidates', 'signal_key', 'TEXT');
+  ensureColumn('saved_wallets', 'source', 'TEXT');
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_signal_key ON candidates(signal_key) WHERE signal_key IS NOT NULL');
   ensureColumn('dry_run_positions', 'execution_mode', "TEXT DEFAULT 'dry_run'");
   ensureColumn('dry_run_positions', 'entry_signature', 'TEXT');

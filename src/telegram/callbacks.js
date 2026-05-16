@@ -10,7 +10,8 @@ import {
   agentKeyboard,
   navKeyboard,
   mainMenuText,
-  walletsText,
+  walletsPageText,
+  walletsPageKeyboard,
   positionsText,
   candidateButtons,
   sendTpSlDefaults,
@@ -51,7 +52,10 @@ export async function handleCallback(query) {
   }
   if (data === 'menu:filters') return editMenuMessage(query, filtersText(), filtersKeyboard());
   if (data === 'menu:strategy') return editMenuMessage(query, strategyMenuText(), strategyKeyboard());
-  if (data === 'menu:wallets') return editMenuMessage(query, walletsText(), navKeyboard());
+  if (data === 'menu:wallets' || data.startsWith('menu:wallets:')) {
+    const page = Number(data.split(':')[2] || 0);
+    return editMenuMessage(query, walletsPageText(page), walletsPageKeyboard(page));
+  }
   if (data === 'menu:positions') return editMenuMessage(query, positionsText(), navKeyboard());
   if (data === 'menu:pnl') {
     const { sendPnl } = await import('./send.js');

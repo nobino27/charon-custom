@@ -1,5 +1,51 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { PublicKey } from '@solana/web3.js';
+import { SAVED_WALLETS_PATH } from '../config.js';
 import { db } from '../db/connection.js';
 import { now } from '../utils.js';
+
+function parseWalletRows(raw) {
+  const parsed = JSON.parse(raw);
+  if (Array.isArray(parsed)) return parsed;
+  if (Array.isArray(parsed?.wallets)) return parsed.wallets;
+  throw new Error('saved wallets JSON must be an array or { "wallets": [...] }');
+}
+
+function normalizeWalletRow(row, index) {
+  const label = String(row?.label || '').trim();
+  const address = String(row?.address || '').trim();
+  const source = String(row?.source || '').trim() || null;
+  if (!label) throw new Error(`wallet #${index + 1} missing label`);
+  if (!address) throw new Error(`wallet ${label} missing address`);
+  try {
+    new PublicKey(address);
+  } catch {
+    throw new Error(`wallet ${label} has invalid Solana address`);
+  }
+  return { label, address, source };
+}
+
+export function initSavedWallets(filePath = SAVED_WALLETS_PATH) {
+  if (!filePath || !existsSync(filePath)) return;
+  const rows = parseWalletRows(readFileSync(filePath, 'utf8'));
+  const wallets = rows.map(normalizeWalletRow);
+  const sync = db.transaction(() => {
+    const removeAddressConflict = db.prepare('DELETE FROM saved_wallets WHERE address = ? AND label != ?');
+    const upsert = db.prepare(`
+      INSERT INTO saved_wallets (label, address, source, created_at_ms)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(label) DO UPDATE SET
+        address = excluded.address,
+        source = excluded.source
+    `);
+    for (const wallet of wallets) {
+      removeAddressConflict.run(wallet.address, wallet.label);
+      upsert.run(wallet.label, wallet.address, wallet.source, now());
+    }
+  });
+  sync();
+  if (wallets.length) console.log(`[wallets] initialized ${wallets.length} saved wallets from ${filePath}`);
+}
 
 export function savedWallets() {
   return db.prepare('SELECT * FROM saved_wallets ORDER BY label').all();

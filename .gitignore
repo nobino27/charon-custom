@@ -9,5 +9,6 @@ node_modules/
 *.log
 .DS_Store
 npm-debug.log*
+config/saved-wallets.json
 
 ARCHITECTURE.md

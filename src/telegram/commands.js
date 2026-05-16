@@ -14,7 +14,6 @@ import {
   agentKeyboard,
   navKeyboard,
   mainMenuText,
-  walletsText,
   positionsText,
   candidateButtons,
   positionButtons,
@@ -108,7 +107,7 @@ export async function handleMessage(msg) {
     db.prepare('DELETE FROM saved_wallets WHERE label = ?').run(label);
     return bot.sendMessage(chatId, `Removed ${label}.`);
   }
-  if (text.startsWith('/wallets')) return handleCallback({ id: 'manual', data: 'menu:wallets', message: { chat: { id: chatId } } });
+  if (text.startsWith('/wallets')) return handleCallback({ id: 'manual', data: 'menu:wallets:0', message: { chat: { id: chatId } } });
   if (text.startsWith('/setfilter')) {
     const { key, value } = parseSetFilter(text);
     const valid = new Set([

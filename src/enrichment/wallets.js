@@ -28,7 +28,15 @@ function normalizeWalletRow(row, index) {
 export function initSavedWallets(filePath = SAVED_WALLETS_PATH) {
   if (!filePath || !existsSync(filePath)) return;
   const rows = parseWalletRows(readFileSync(filePath, 'utf8'));
-  const wallets = rows.map(normalizeWalletRow);
+  const skipped = [];
+  const wallets = rows.map((row, index) => {
+    try {
+      return normalizeWalletRow(row, index);
+    } catch (err) {
+      skipped.push(err.message);
+      return null;
+    }
+  }).filter(Boolean);
   const sync = db.transaction(() => {
     const removeAddressConflict = db.prepare('DELETE FROM saved_wallets WHERE address = ? AND label != ?');
     const upsert = db.prepare(`
@@ -44,7 +52,10 @@ export function initSavedWallets(filePath = SAVED_WALLETS_PATH) {
     }
   });
   sync();
-  if (wallets.length) console.log(`[wallets] initialized ${wallets.length} saved wallets from ${filePath}`);
+  for (const message of skipped) console.log(`[wallets] skipped ${message}`);
+  if (wallets.length || skipped.length) {
+    console.log(`[wallets] initialized ${wallets.length} saved wallets from ${filePath}${skipped.length ? `, skipped ${skipped.length}` : ''}`);
+  }
 }
 
 export function savedWallets() {
